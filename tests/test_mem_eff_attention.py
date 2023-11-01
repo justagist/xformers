@@ -13,6 +13,7 @@ from scipy.stats import binomtest
 from torch.utils.checkpoint import checkpoint
 
 import xformers.ops
+from xformers.attn_bias_utils import create_attn_bias
 from xformers.ops import fmha
 from xformers.ops.fmha import ALL_BW_OPS, ALL_FW_OPS
 from xformers.ops.fmha.common import AttentionOpBase
@@ -168,10 +169,10 @@ def _generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv(
                         B, Mq, Mkv, H, K, Kv = shape
                         B = min(B, 12)
 
-                        if (
-                            bias_type
-                            is fmha.attn_bias.BlockDiagonalCausalFromBottomRightMask
-                        ):
+                        if bias_type in {
+                            fmha.attn_bias.BlockDiagonalCausalFromBottomRightMask,
+                            fmha.attn_bias.BlockDiagonalCausalLocalAttentionFromBottomRightMask,
+                        }:
                             Mq, Mkv = min(Mkv, Mq), max(Mkv, Mq) + 2
                         elif (
                             bias_type
@@ -232,10 +233,20 @@ parametrize_opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv__xs = pytest.mark.parametriz
 
 def ref_attention(q, k, v, attn_bias=None, drop_mask=None, p=0.0, scale=None):
     if q.ndim == 5:
+
+        def attn_bias_group(group: int):
+            if isinstance(attn_bias, torch.Tensor):
+                return attn_bias[:, group]
+            if isinstance(attn_bias, fmha.attn_bias.LowerTriangularMaskWithTensorBias):
+                return fmha.attn_bias.LowerTriangularMaskWithTensorBias(
+                    attn_bias._bias[:, group]
+                )
+            return attn_bias
+
         return torch.stack(
             [
                 ref_attention_bmhk(
-                    q[:, :, g], k[:, :, g], v[:, :, g], attn_bias=attn_bias
+                    q[:, :, g], k[:, :, g], v[:, :, g], attn_bias=attn_bias_group(g)
                 )
                 for g in range(q.shape[2])
             ],
@@ -293,48 +304,6 @@ def ref_attention_bmhk(q, k, v, attn_bias, scale=None) -> torch.Tensor:
     return out.permute((0, 2, 1, 3))
 
 
-def _rand_seqlens(
-    r: random.Random,
-    bs: int,
-    q_len: int,
-    kv_len: int,
-    more_keys_than_queries_per_block: bool,
-) -> Tuple[Sequence[int], Sequence[int]]:
-    """
-    Generates lists of lengths of query blocks and corresponding key blocks.
-    The total number of queries will be bs * q_len and the
-    total number of keys will be bs * kv_len.
-    """
-    if more_keys_than_queries_per_block:
-        assert kv_len >= q_len
-    q_len *= bs
-    kv_len *= bs
-    seqlens_q: List[int] = []
-    seqlens_k: List[int] = []
-
-    step_q = [max(1, q_len // 10), max(2, q_len // 2)]
-    step_k = [max(1, kv_len // 10), max(2, kv_len // 2)]
-    while sum(seqlens_q) < q_len and sum(seqlens_k) < kv_len:
-        num_queries = r.randrange(*step_q)
-        seqlens_q.append(num_queries)
-
-        if more_keys_than_queries_per_block:
-            # Must select at least `num_queries` keys
-            # But also leave enough keys for later
-            keys_left = kv_len - sum(seqlens_k, 0)
-            queries_left = q_len - sum(seqlens_q[:-1], 0)
-            assert keys_left >= queries_left
-            if keys_left - queries_left > 0:
-                seqlens_k.append(num_queries + r.randrange(0, keys_left - queries_left))
-            else:
-                seqlens_k.append(num_queries)
-        else:
-            seqlens_k.append(r.randrange(*step_k))
-    seqlens_q[-1] = q_len - sum(seqlens_q[:-1])
-    seqlens_k[-1] = kv_len - sum(seqlens_k[:-1])
-    return seqlens_q, seqlens_k
-
-
 def _rand_partition(r: random.Random, total: int, n: int) -> List[int]:
     # returns list of n nonnegative integers summing to total
     idx = {0, total}
@@ -342,157 +311,6 @@ def _rand_partition(r: random.Random, total: int, n: int) -> List[int]:
         idx.add(r.randint(1, total - 1))
     s = sorted(idx)
     return [e - b for b, e in zip(s[:-1], s[1:])]
-
-
-def _rand_maxed_partition(
-    r: random.Random, total: int, n: int, mx: int, positive: bool = True
-) -> List[int]:
-    # returns list of n nonnegative integers less than mx summing to total
-    # NB: This is unfortunately biased towards evenly-split bins.
-    # If `positive`, outputs are positive
-    if positive:
-        total -= n
-        mx -= 1
-    idxs = r.sample(range(n * mx), total)
-    y = torch.zeros(n, mx, dtype=torch.int32)
-    y.flatten()[idxs] = 1
-    z = y.sum(1)
-    if positive:
-        z += 1
-    return z.tolist()
-
-
-def _rand_seqlens_padded_k(
-    r: random.Random, bs: int, q_len: int, kv_len: int
-) -> Tuple[Sequence[int], Sequence[int]]:
-    # This is for BlockDiagonalCausalWithOffsetPaddedKeysMask.
-    # we need q_seqlens and k_seqlens to be of len bsz.
-    # For each "batch element" there must be more keys than queries
-    # because this bias type is "bottom right" and so any extra queries
-    # will attend to nothing and have undefined result.
-    # In addition every element of k_seqlens must be <= kv_len
-    if q_len > kv_len:
-        raise ValueError("need more keys than values")
-    if q_len == kv_len:
-        # all key slots are needed so we cannot have padding
-        q_seqlens = k_seqlens = [kv_len] * bs
-    else:
-        q_seqlens = _rand_maxed_partition(r, q_len * bs, bs, kv_len)
-        k_seqlens = [r.randint(i, kv_len) for i in q_seqlens]
-    return q_seqlens, k_seqlens
-
-
-def _create_aligned_bias(B: int, H: int, Mq: int, Mkv: int, **kwargs) -> torch.Tensor:
-    align_to = 8
-    return (
-        torch.randn(
-            (
-                B,
-                H,
-                Mq,
-                align_to * ((Mkv + align_to - 1) // align_to),
-            ),
-            **kwargs,
-        )
-        * 3
-    )[:, :, :, :Mkv]
-
-
-def create_attn_bias(
-    bias_type,
-    batch_size: int,
-    num_heads: int,
-    q_len: int,
-    kv_len: int,
-    device,
-    dtype,
-    requires_grad: bool,
-    fmt: str,
-    op: Type[AttentionOpBase],
-):
-    if bias_type is None or isinstance(None, bias_type):
-        return None
-    r = random.Random("-".join(map(str, [batch_size, q_len, kv_len, dtype, fmt])))
-    if bias_type is torch.Tensor:
-        if fmt == "BMK":
-            batch_size *= num_heads
-            num_heads = 1
-        # `small_k` only supports an expanded 1d bias
-        if op in [fmha.small_k.FwOp, fmha.small_k.BwOp]:
-            attn_bias = (
-                torch.randn(
-                    (batch_size, num_heads, 1, kv_len), device=device, dtype=dtype
-                )
-                * 3
-            )
-            attn_bias = attn_bias.expand(batch_size, num_heads, q_len, kv_len)
-        else:
-            attn_bias = _create_aligned_bias(
-                batch_size,
-                num_heads,
-                q_len,
-                kv_len,
-                device=device,
-                dtype=dtype,
-            )
-
-            # make sure it also works if the first columns are partially masked out
-            attn_bias[0, 0, q_len - 1 :, : num_heads - 2] = -math.inf
-
-        if requires_grad:
-            attn_bias.requires_grad_(True)
-        if fmt == "BMK":
-            attn_bias = attn_bias[:, 0]
-        return attn_bias
-    if bias_type is fmha.attn_bias.LowerTriangularMask:
-        return fmha.attn_bias.LowerTriangularMask()
-    if bias_type is fmha.attn_bias.LowerTriangularMaskWithTensorBias:
-        attn_bias = _create_aligned_bias(
-            batch_size,
-            num_heads,
-            q_len,
-            kv_len,
-            device=device,
-            dtype=dtype,
-        )
-        if requires_grad:
-            attn_bias.requires_grad_(True)
-        return fmha.attn_bias.LowerTriangularMaskWithTensorBias(attn_bias)
-    if bias_type in [
-        fmha.attn_bias.BlockDiagonalMask,
-        fmha.attn_bias.BlockDiagonalCausalMask,
-        fmha.attn_bias.BlockDiagonalCausalFromBottomRightMask,
-    ]:
-        # This bias is not supported in BMK format
-        assert fmt in ["BMGHK", "BMHK"]
-        block_diag = fmha.attn_bias.BlockDiagonalMask.from_seqlens(
-            *_rand_seqlens(
-                r,
-                batch_size,
-                q_len,
-                kv_len,
-                more_keys_than_queries_per_block=bias_type
-                is fmha.attn_bias.BlockDiagonalCausalFromBottomRightMask,
-            )
-        )
-        if bias_type is fmha.attn_bias.BlockDiagonalCausalMask:
-            block_diag = block_diag.make_causal()
-        if bias_type is fmha.attn_bias.BlockDiagonalCausalFromBottomRightMask:
-            block_diag = block_diag.make_causal_from_bottomright()
-        return block_diag
-    if bias_type == fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask:
-        assert fmt == "BMHK"
-        q, k = _rand_seqlens_padded_k(r, batch_size, q_len, kv_len)
-        g_block_diag = (
-            fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
-                q_seqlen=q,
-                kv_padding=kv_len,
-                kv_seqlen=k,
-            )
-        )
-        return g_block_diag
-
-    assert False, f"Unsupported bias type: {bias_type}"
 
 
 def get_bias_grad(attn_bias, clear: bool = False) -> Optional[torch.Tensor]:
@@ -523,8 +341,22 @@ def create_tensors(
     *,
     attn_bias_requires_grad: bool = False,
     fmt: str = "BMK",
+    g: int = 1,
 ):
     torch.manual_seed(B * q_len + kv_len * k + kv)
+
+    mask_is_bottom_right = attn_bias_type is not None and issubclass(
+        attn_bias_type,
+        (
+            fmha.attn_bias.BlockDiagonalCausalFromBottomRightMask,
+            fmha.attn_bias.BlockDiagonalCausalLocalAttentionFromBottomRightMask,
+            fmha.attn_bias.BlockDiagonalCausalLocalAttentionMask,
+        ),
+    )
+    if mask_is_bottom_right and q_len > kv_len:
+        pytest.skip(
+            "Bottom-right attention and local-attention masks require q_len <= kv_len"
+        )
     scale = 3
     if fmt == "BMK":
         query = torch.randn((B * h, q_len, k), device=device, dtype=dtype)
@@ -536,18 +368,17 @@ def create_tensors(
         value = torch.randn((B, kv_len, h, kv), device=device, dtype=dtype)
     else:
         assert fmt == "BMGHK"
-        assert h % 2 == 0, "BMGHK tests only support h%2==0 now"
-        query = torch.randn((B, q_len, 2, h // 2, k), device=device, dtype=dtype)
-        key = torch.randn((B, kv_len, 2, 1, k), device=device, dtype=dtype)
-        value = torch.randn((B, kv_len, 2, 1, kv), device=device, dtype=dtype)
+        query = torch.randn((B, q_len, g, h, k), device=device, dtype=dtype)
+        key = torch.randn((B, kv_len, g, 1, k), device=device, dtype=dtype)
+        value = torch.randn((B, kv_len, g, 1, kv), device=device, dtype=dtype)
 
     for x in [query, key, value]:
         x.mul_(scale)
 
     if fmt == "BMGHK":
         # Expand - after the in-place mul
-        key = key.expand((B, kv_len, 2, h // 2, k))
-        value = value.expand((B, kv_len, 2, h // 2, k))
+        key = key.expand((B, kv_len, g, h, k))
+        value = value.expand((B, kv_len, g, h, k))
 
     if fmt == "BMK" and not fmha.common._is_bias_type_supported_in_BMK(attn_bias_type):
         attn_bias_type = None
@@ -557,6 +388,7 @@ def create_tensors(
             attn_bias_type,
             batch_size=B,
             num_heads=h,
+            num_heads_groups=g,
             q_len=q_len,
             kv_len=kv_len,
             dtype=dtype,
@@ -603,11 +435,7 @@ def bmk2bmhk(tensor, num_heads: int) -> torch.Tensor:
 @pytest.mark.parametrize("fmt", ["BMK", "BMHK"])
 @pytest.mark.parametrize("packed", [False, True])
 @parametrize_opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv
-def test_forward(
-    opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
-    packed,
-    fmt,
-):
+def test_forward(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv, packed, fmt, **kwargs):
     (
         op,
         device,
@@ -628,7 +456,9 @@ def test_forward(
         pytest.skip("BMK incompatible with this bias")
 
     query, key, value, attn_bias = create_tensors(
-        *opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv, fmt="BMHK" if packed else fmt
+        *opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
+        fmt="BMHK" if packed else fmt,
+        **kwargs,
     )
 
     if packed:
@@ -642,6 +472,7 @@ def test_forward(
                 bias_type=bias_type,
                 batch_size=batch_size,
                 num_heads=h,
+                num_heads_groups=1,
                 q_len=q_len,
                 kv_len=kv_len,
                 device=device,
@@ -679,12 +510,13 @@ def test_forward(
     )
 
 
+@cuda_only
 @pytest.mark.parametrize("k_len", [5, 6, 32])
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("kv_len", [128, 512])
 @pytest.mark.parametrize("q_len", [128, 512])
-@pytest.mark.parametrize("device", _devices)
-def test_key_query_all_ones(device, q_len, kv_len, batch_size, k_len):
+def test_key_query_all_ones(q_len, kv_len, batch_size, k_len):
+    device = "cuda"
     scale = 3
     query = torch.ones((batch_size, q_len, k_len), device=device)
     key = torch.ones((batch_size, kv_len, k_len), device=device)
@@ -750,6 +582,35 @@ def test_logsumexp(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv):
     if isinstance(attn_bias, fmha.attn_bias.BlockDiagonalMask):
         lse = _block_diag_reshape_lse(lse, attn_bias.q_seqinfo)
     assert_allclose(lse[:, 0, : ref_lse.shape[1]], ref_lse, atol=2e-4)
+
+
+@cuda_only
+@pytest.mark.parametrize("op", [fmha.cutlass.FwOp, fmha.flash.FwOp])
+def test_logsumexp_mqa(op):
+    if not op.is_available():
+        pytest.skip("not available")
+
+    dtype = torch.float16
+    s = 3
+    query = torch.randn([1, 1, 32, 128], dtype=dtype, device="cuda") * s
+    key = (torch.randn([1, 16, 1, 128], dtype=dtype, device="cuda") * s).expand(
+        -1, -1, 32, -1
+    )
+    value = (torch.randn([1, 16, 1, 128], dtype=dtype, device="cuda") * s).expand(
+        -1, -1, 32, -1
+    )
+    assert key.stride(2) == 0
+
+    _, lse = xformers.ops.memory_efficient_attention_forward_requires_grad(
+        query,
+        key,
+        value,
+        op=op,
+    )
+    query, key, value = [x[0].transpose(0, 1) for x in [query, key, value]]
+    attn = (query.float() / query.shape[-1] ** 0.5) @ key.float().transpose(-2, -1)
+    ref_lse = attn.logsumexp(-1)
+    assert_allclose(lse[0, :, 0], ref_lse[:, 0], atol=2e-4)
 
 
 @pytest.mark.parametrize("fmt", ["BMK", "BMHK"])
@@ -1087,14 +948,13 @@ def test_dropout_backward_cutlass(dt, q_len, kv_len, batch_size, k, p):
     )
 
 
+@cuda_only
 @pytest.mark.parametrize("k_len", [32])
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("kv_len", [3 * 32])
 @pytest.mark.parametrize("q_len", [3 * 32])
-@pytest.mark.parametrize("device", _devices)
-def test_memory_efficient_attention_full_block_masked(
-    device, q_len, kv_len, batch_size, k_len
-):
+def test_memory_efficient_attention_full_block_masked(q_len, kv_len, batch_size, k_len):
+    device = "cuda"
     op_fw = fmha.small_k.FwOp
     op_bw = fmha.small_k.BwOp
 
@@ -1604,20 +1464,16 @@ def test_attn_bias_padded() -> None:
     bsize, n_heads, d, padding = 8, 3, 8, 32
 
     # Q / KV have different seqlen
-    k = torch.randn((bsize, padding, n_heads, d)).cuda().half()
+    k = torch.randn((bsize, padding, n_heads, d), device="cuda", dtype=torch.float16)
     k_seqlen = [5, 8, 7, 1, 9, 3, 12, 32]
     other = bsize - 1
-    v = torch.randn((bsize, padding, n_heads, d)).cuda().half()
+    v = torch.randn((bsize, padding, n_heads, d), device="cuda", dtype=torch.float16)
     n_q_first = 4
     q = [
-        torch.randn((1, n_q_first, n_heads, d)).cuda().half(),
-        torch.randn((1, other, n_heads, d)).cuda().half(),
+        torch.randn((1, n_q_first, n_heads, d), device="cuda", dtype=torch.float16),
+        torch.randn((1, other, n_heads, d), device="cuda", dtype=torch.float16),
     ]
     q_cat = torch.cat([x.view(1, -1, n_heads, d) for x in q], dim=1)
-    # causal_diagonal = torch.tensor(
-    #     [0] + [i - 1 for i in k_seqlen[1:]], dtype=torch.int32
-    # ).cuda()
-
     q_seqlen = [n_q_first] + [1] * other
 
     attn_bias = fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
@@ -1661,57 +1517,98 @@ def test_attn_bias_padded() -> None:
     )
 
 
+def _kv_heads_label(kv_heads: Optional[int]) -> str:
+    if kv_heads is None:
+        return ""
+    if kv_heads == 1:
+        return "mq"
+    return f"gqa{kv_heads}"
+
+
 @sm70_or_better_only
 @pytest.mark.parametrize(
     "op",
     [
         fmha.decoder.FwOp,
-        fmha.triton_splitk.FwOp,
     ],
 )
-@pytest.mark.parametrize("multiquery", [True, False], ids=lambda x: "mq" if x else "")
-@pytest.mark.parametrize("n_heads", [1, 16, 32])
+@pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
+@pytest.mark.parametrize("bsz,n_heads", [(1, 1), (1, 16), (1, 32), (8, 1), (4, 8)])
 @pytest.mark.parametrize("padding", [32, 4096])
-@pytest.mark.parametrize("bsz", [1, 8])
 @pytest.mark.parametrize("dtype", ["f16", "bf16", "f32"])
 def test_decoder(
-    op, multiquery: bool, n_heads: int, padding: int, bsz: int, dtype: str
+    op,
+    n_heads: int,
+    kv_heads: Optional[int],
+    padding: int,
+    bsz: int,
+    dtype: str,
+    dequant: bool = False,
+    num_queries: int = 1,
 ) -> None:
+    # kv_heads = 1: multiquery
+    # kv_heads = None: neither MQA nor GQA
+    # kv_heads > 1: BMGHK
+    if dtype == "bf16" and compute_capability < (8, 0):
+        raise pytest.skip("BF16 is only supported on SM80+")
     dtype_ = {"f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32}[dtype]
     torch.manual_seed(1)
     d = 128
-    k_shape = (1, bsz * padding, n_heads, d)
-    # TODO: support 2 kv heads etc.
-    k = torch.randn(k_shape, dtype=dtype_).cuda()
-    k_seqlen = torch.randint(1, padding + 1, (bsz,)).tolist()
-    v = torch.randn(k_shape, dtype=dtype_).cuda()
-    q = torch.randn((1, bsz, n_heads, d), dtype=dtype_).cuda()
-    causal_diagonal = torch.tensor(  # TODO: make unnecessary
-        [i - 1 for i in k_seqlen], dtype=torch.int32
-    ).cuda()
+    if kv_heads is not None and kv_heads > 1:
+        k_shape: Tuple[int, ...] = (1, bsz * padding, kv_heads, n_heads, d)
+        q_shape: Tuple[int, ...] = (
+            1,
+            bsz * num_queries,
+            kv_heads,
+            n_heads,
+            d,
+        )
+    else:
+        k_shape = (1, bsz * padding, n_heads, d)
+        q_shape = (1, bsz * num_queries, n_heads, d)
 
-    if multiquery:
-        k = k[:, :, :1].expand(k_shape)
-        v = v[:, :, :1].expand(k_shape)
+    # TODO: support 2 kv heads etc.
+    k = torch.randn(k_shape, dtype=dtype_, device="cuda")
+    k_seqlen = torch.randint(num_queries, padding + 1, (bsz,)).tolist()
+    v = torch.randn(k_shape, dtype=dtype_, device="cuda")
+    q = torch.randn(q_shape, dtype=dtype_, device="cuda")
+
+    if dequant:
+        k_shape = k_shape[:-1] + (d // 8 + op.NUM_GROUPS,)
+        k = torch.zeros(k_shape, dtype=torch.int32, device="cuda")
+        k.random_()
+        k[..., : op.NUM_GROUPS].view(torch.float16).fill_(1.0)
+        v = torch.zeros(k_shape, dtype=torch.int32, device="cuda")
+        v.random_()
+        v[..., : op.NUM_GROUPS].view(torch.float16).fill_(1.0)
+
+    if kv_heads is not None:
+        k = k[..., :1, :].expand(k_shape)
+        v = v[..., :1, :].expand(k_shape)
 
     attn_bias = fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
-        q_seqlen=[1] * bsz,
+        q_seqlen=[num_queries] * bsz,
         kv_seqlen=k_seqlen,
-        causal_diagonal=causal_diagonal,
         kv_padding=padding,
     )
-    inp = fmha.Inputs(q, k, v, attn_bias=attn_bias)
-    if not op.supports(inp):
-        pytest.skip("not supported")
 
     decoder_output = fmha.memory_efficient_attention_forward(
-        q, k, v, attn_bias, op=fmha.decoder.FwOp
+        q,
+        k,
+        v,
+        attn_bias,
+        op=op,
     )
 
-    if dtype == "bf16" and compute_capability < (8, 0):
-        # cutlass not supported. This test only checks there is a result.
-        assert not decoder_output.isnan().any()
-        return
+    def dequant_cache(x):
+        x = x[..., op.NUM_GROUPS :, None].expand(k_shape[:-1] + (d // 8, 8))
+        x = x // (2 ** (4 * torch.arange(8, device="cuda")))
+        x = (x % 16).flatten(start_dim=-2)
+        return x.to(dtype_) + 1.0
+
+    if dequant:
+        k = dequant_cache(k)
+        v = dequant_cache(v)
 
     cutlass_output = fmha.memory_efficient_attention_forward(
         q, k, v, attn_bias, op=fmha.cutlass.FwOp
@@ -1721,6 +1618,46 @@ def test_decoder(
         cutlass_output,
         atol=fmha.cutlass.FwOp.ERROR_ATOL[dtype_] * 4,
         rtol=fmha.cutlass.FwOp.ERROR_RTOL[dtype_],
+    )
+
+
+@sm80_or_better_only
+@pytest.mark.parametrize(
+    "op,dequant,dtype",
+    [
+        (fmha.triton_splitk.FwOp_S2, False, "bf16"),
+        (fmha.triton_splitk.FwOp_S2, False, "f16"),
+        (fmha.triton_splitk.FwOp_S2, True, "bf16"),
+        (
+            type(
+                "S2_8", (fmha.triton_splitk.FwOp_S2,), {"NUM_GROUPS": 8, "NAME": "S2_8"}
+            ),
+            True,
+            "bf16",
+        ),
+    ],
+)
+@pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
+@pytest.mark.parametrize("n_heads", [16])
+@pytest.mark.parametrize("padding, bsz", [(32, 8), (4096, 1)])
+def test_triton_splitk_decoder(
+    op,
+    dequant: bool,
+    kv_heads: Optional[int],
+    n_heads: int,
+    padding: int,
+    bsz: int,
+    dtype: str,
+) -> None:
+    # We omit dequant with f16: it needs a very high tol
+    test_decoder(
+        op,
+        kv_heads=kv_heads,
+        n_heads=n_heads,
+        padding=padding,
+        bsz=bsz,
+        dtype=dtype,
+        dequant=dequant,
     )
 
 
@@ -1756,7 +1693,6 @@ def test_attn_bias_blockdiag_doc() -> None:
     q, k, v = linear(x).reshape([1, -1, 1, 3, K]).unbind(-2)
     out = fmha.memory_efficient_attention(q, k, v, attn_bias=attn_bias)
     list_out = attn_bias.split(out)
-    print(list_out[0].shape)  # [1, 3, 1, K]
     assert tuple(list_out[0].shape) == (1, 3, 1, K)
 
 
@@ -1876,6 +1812,40 @@ def test_has_kernel_for(sm_shmem: Tuple[int, int], dtype_str: str) -> None:
         ), f"k={k}"
 
 
+def test_window_size_materialize() -> None:
+    seqlens = [4, 6]
+    attn_bias = fmha.attn_bias.BlockDiagonalMask.from_seqlens(
+        q_seqlen=seqlens,
+        kv_seqlen=seqlens,
+    ).make_local_attention(2)
+    mask = attn_bias.materialize(
+        (1, 1, sum(seqlens), sum(seqlens)),
+        device="cpu",
+        dtype=torch.float32,
+    )
+    true_mask = torch.log(
+        torch.Tensor(
+            [
+                [
+                    [
+                        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+                        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+                    ]
+                ]
+            ]
+        )
+    )
+    assert torch.all(mask == true_mask)
+
+
 @cuda_only
 @pytest.mark.parametrize(
     "opFW_biasT",
@@ -1899,6 +1869,48 @@ def test_forward_gqa(opFW_biasT):
         ),
         packed=False,
         fmt="BMGHK",
+        g=2,
+    )
+
+
+@cuda_only
+@pytest.mark.parametrize(
+    "opBW",
+    [
+        fmha.flash.BwOp,
+        fmha.cutlass.BwOp,
+    ],
+)
+def test_backward_gqa(opBW):
+    H = 8
+    B_Mq_Mkv_H_K_Kv = (3, 512, 512, H, 128, 128)
+    dtype = torch.float16
+    query, key, value, attn_bias = create_tensors(
+        *(opBW, "cuda", dtype, type(None), *B_Mq_Mkv_H_K_Kv),
+        attn_bias_requires_grad=False,
+        fmt="BMHK",
+    )
+    op = (fmha.cutlass.FwOp, opBW)
+    key = key[:, :, :1].expand(-1, -1, H, -1)
+    value = value[:, :, :1].expand(-1, -1, H, -1)
+    key.requires_grad_(True)
+    out = fmha.memory_efficient_attention(query, key, value, attn_bias=attn_bias)
+    out_ref = ref_attention_bmhk(query, key, value, attn_bias=attn_bias)
+    assert_allclose(
+        out.float(),
+        out_ref.float(),
+        atol=op[0].ERROR_ATOL[dtype],
+        rtol=op[0].ERROR_RTOL[dtype],
+    )
+    out.backward(query)
+    dk = key.grad
+    key.grad = None
+    out_ref.backward(query)
+    assert_allclose(
+        dk.float(),
+        key.grad.float(),
+        atol=op[1].ERROR_ATOL[dtype],
+        rtol=op[1].ERROR_RTOL[dtype],
     )
 
 
@@ -1911,7 +1923,11 @@ def test_forward_gqa_one_group(opFW):
     k = torch.randn([B, Mkv, 1, H, K], dtype=dtype, device="cuda") * 3
     v = torch.randn([B, Mkv, 1, H, K], dtype=dtype, device="cuda") * 3
 
-    assert opFW.supports(fmha.Inputs(q, k, v))
+    supported = opFW.supports(fmha.Inputs(q, k, v))
+    if not supported:
+        supported_bmhk = opFW.supports(fmha.Inputs(q[:, :, 0], k[:, :, 0], v[:, :, 0]))
+        assert supported == supported_bmhk
+        pytest.skip("not supported")
     out = fmha.memory_efficient_attention_forward(q, k, v, op=opFW)
     ref = ref_attention(q, k, v)
     assert_allclose(
@@ -1956,14 +1972,20 @@ def _dispatches_to_splitK(q, kv):
     )
 
 
-def test_dispatch_splitk_bmhk() -> None:
+def _dispatches_to_flash_decoding(q, kv):
+    return (
+        _dispatch_fw_priority_list(fmha.Inputs(q, kv, kv), False)[0] is fmha.flash.FwOp
+    )
+
+
+def test_dispatch_decoding_bmhk() -> None:
     assert not _dispatches_to_splitK(
         torch.empty([1, 8, 1, 128]), torch.empty([1, 2048, 1, 128])
     ), "Should not use SplitK with 1 head (no tensorcores)"
-    assert _dispatches_to_splitK(
+    assert _dispatches_to_flash_decoding(
         torch.empty([1, 8, 32, 128]),
         torch.empty([1, 2048, 1, 128]).expand(-1, -1, 32, -1),
-    ), "Should use SplitK with BMHK MQA"
+    ), "Should use Flash-Decoding with BMHK MQA"
     assert not _dispatches_to_splitK(
         torch.empty([1, 8, 32, 128]),
         torch.empty([1, 2048, 32, 128]),
@@ -1978,18 +2000,18 @@ def test_dispatch_splitk_bmhk() -> None:
     ), "Should not use SplitK if B is big"
 
 
-def test_dispatch_splitk_bmghk() -> None:
+def test_dispatch_decoding_bmghk() -> None:
     assert not _dispatches_to_splitK(
         torch.empty([1, 8, 1, 1, 128]), torch.empty([1, 2048, 1, 1, 128])
     ), "Should not use SplitK with 1 head (no tensorcores)"
-    assert _dispatches_to_splitK(
+    assert _dispatches_to_flash_decoding(
         torch.empty([1, 8, 1, 32, 128]),
         torch.empty([1, 2048, 1, 1, 128]).expand(-1, -1, -1, 32, -1),
-    ), "Should use SplitK with MQA"
-    assert _dispatches_to_splitK(
+    ), "Should use Flash-Decoding with MQA"
+    assert _dispatches_to_flash_decoding(
         torch.empty([1, 8, 4, 32, 128]),
         torch.empty([1, 2048, 4, 1, 128]).expand(-1, -1, -1, 32, -1),
-    ), "Should use SplitK with GQA"
+    ), "Should use Flash-Decoding with GQA"
     assert not _dispatches_to_splitK(
         torch.empty([1, 8, 1, 32, 128]),
         torch.empty([1, 2048, 1, 32, 128]),
@@ -2071,6 +2093,68 @@ def test_mqa_decoding(op: Type[fmha.AttentionFwOpBase], dtype, B_Mkv_H_K):
         atol=op.ERROR_ATOL[dtype],
         rtol=op.ERROR_RTOL.get(dtype, 1e-5),
     )
+
+
+@parametrize_opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv__xs
+def test_empty_tensors_empty_query(
+    opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
+):
+    query, key, value, attn_bias = create_tensors(
+        *opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
+        fmt="BMHK",
+    )
+    opFW = opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv[0]
+
+    query = query[:, :0]
+    query.requires_grad_(True)
+    key.requires_grad_(True)
+    value.requires_grad_(True)
+    out = xformers.ops.memory_efficient_attention(query, key, value, op=(opFW, None))
+    assert out.shape[1] == 0
+    out.backward(out)
+    # dK/dV should be all zeros
+    assert_allclose(key.grad, torch.zeros_like(key.grad), "key.grad")
+    assert_allclose(value.grad, torch.zeros_like(value.grad), "value.grad")
+
+
+@parametrize_opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv__xs
+def test_empty_tensors_empty_kv(
+    opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
+):
+    query, key, value, attn_bias = create_tensors(
+        *opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
+        fmt="BMHK",
+    )
+    opFW = opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv[0]
+
+    key = key[:, :0]
+    value = value[:, :0]
+    query.requires_grad_(True)
+    key.requires_grad_(True)
+    value.requires_grad_(True)
+    out = xformers.ops.memory_efficient_attention(query, key, value, op=(opFW, None))
+    assert_allclose(out, torch.zeros_like(out), "out")
+    out.backward(out)
+    # dQ should be all zeros
+    assert_allclose(query.grad, torch.zeros_like(query.grad), "query.grad")
+
+
+@parametrize_opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv__xs
+def test_empty_tensors_empty_b(
+    opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
+):
+    query, key, value, attn_bias = create_tensors(
+        *opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
+        fmt="BMHK",
+    )
+    opFW = opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv[0]
+
+    query, key, value = query[:0], key[:0], value[:0]
+    query.requires_grad_(True)
+    key.requires_grad_(True)
+    value.requires_grad_(True)
+    out = xformers.ops.memory_efficient_attention(query, key, value, op=(opFW, None))
+    out.backward(out)
 
 
 # end of file

@@ -5,7 +5,8 @@
 
 import math
 from dataclasses import dataclass
-from typing import Any, List, Mapping, Optional, Set, Tuple, Type, Union
+from functools import partial
+from typing import Any, Callable, List, Mapping, Optional, Set, Tuple, Type, Union
 
 import torch
 
@@ -26,6 +27,17 @@ def _is_bias_type_supported_in_BMK(attn_bias_type: Any) -> bool:
     if attn_bias_type in [LowerTriangularMask, torch.Tensor]:
         return True
     return False
+
+
+def _attn_bias_apply(
+    attn_bias: Optional[Union[torch.Tensor, AttentionBias]],
+    op: Callable[[torch.Tensor], torch.Tensor],
+) -> Optional[Union[torch.Tensor, AttentionBias]]:
+    if isinstance(attn_bias, torch.Tensor):
+        return op(attn_bias)
+    if isinstance(attn_bias, LowerTriangularMaskWithTensorBias):
+        return LowerTriangularMaskWithTensorBias(op(attn_bias._bias))
+    return attn_bias
 
 
 @dataclass
@@ -49,6 +61,23 @@ class Inputs:
     def scale_float(self) -> float:
         return self.query.shape[-1] ** (-0.5) if self.scale is None else self.scale
 
+    def get_qkv_in_bmghk(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.query.ndim == 5:
+            return self.query, self.key, self.value
+        if self.query.ndim == 4:
+            return (
+                self.query.unsqueeze(2),
+                self.key.unsqueeze(2),
+                self.value.unsqueeze(2),
+            )
+        if self.value.ndim == 3:
+            return (
+                self.query[:, :, None, None],
+                self.key[:, :, None, None],
+                self.value[:, :, None, None],
+            )
+        assert False
+
     def normalize_bmhk(self) -> Tuple[int, ...]:
         if self.query.ndim not in [3, 4, 5]:
             raise ValueError(
@@ -68,12 +97,9 @@ class Inputs:
             self.query = self.query.unsqueeze(2)
             self.key = self.key.unsqueeze(2)
             self.value = self.value.unsqueeze(2)
-            if isinstance(self.attn_bias, torch.Tensor):
-                if self.attn_bias.ndim != 3:
-                    raise ValueError(
-                        f"Expected BMK format for attn_bias, but got {self.attn_bias.shape}"
-                    )
-                self.attn_bias = self.attn_bias.unsqueeze(1)
+            self.attn_bias = _attn_bias_apply(
+                self.attn_bias, partial(torch.unsqueeze, dim=1)
+            )
         return output_shape
 
     def validate_inputs(self) -> None:
@@ -82,7 +108,7 @@ class Inputs:
             x.ndim != self.query.ndim for x in qkv
         ):
             raise ValueError(
-                f"Query/Key/Value should all have BMHK or BMK shape.\n"
+                f"Query/Key/Value should all have BMGHK, BMHK, or BMK shape.\n"
                 f"  query.shape: {self.query.shape}\n"
                 f"  key.shape  : {self.key.shape}\n"
                 f"  value.shape: {self.value.shape}"
@@ -143,6 +169,8 @@ class Inputs:
         K = self.query.shape[-1]
         B, Mkv = self.key.shape[:2]
         Kv = self.value.shape[-1]
+        quantized_kv_cache = self.value.dtype == torch.int32
+        key_embed_dim = Kv if quantized_kv_cache else K
 
         valid_shapes = True
         if self.query.ndim == 3:  # BMK
@@ -153,8 +181,6 @@ class Inputs:
             )
         H = self.query.shape[-2]
         if self.query.ndim == 4:  # BMHK
-            quantized_kv_cache = self.value.dtype == torch.int32
-            key_embed_dim = Kv if quantized_kv_cache else K
             valid_shapes = (
                 self.query.shape == (B, Mq, H, K)
                 and self.key.shape == (B, Mkv, H, key_embed_dim)
@@ -164,7 +190,7 @@ class Inputs:
         if self.query.ndim == 5:  # BMNHK
             valid_shapes = (
                 self.query.shape == (B, Mq, G, H, K)
-                and self.key.shape == (B, Mkv, G, H, K)
+                and self.key.shape == (B, Mkv, G, H, key_embed_dim)
                 and self.value.shape == (B, Mkv, G, H, Kv)
             )
         if not valid_shapes:
@@ -306,7 +332,7 @@ class AttentionOpBase(BaseOperator):
                 "operator is non-deterministic, but `torch.use_deterministic_algorithms` is set"
             )
         if not cls.SUPPORTS_BMGHK and d.query.ndim == 5:
-            reasons.append("operator does not support BMNHK format")
+            reasons.append("operator does not support BMGHK format")
         return reasons
 
 
@@ -498,9 +524,9 @@ class AttentionOpDispatch:
 def bmk2bmhk(tensor, num_heads: int) -> torch.Tensor:
     if tensor.ndim == 4:
         return tensor
-    return tensor.reshape([-1, num_heads, tensor.shape[1], tensor.shape[2]]).permute(
-        (0, 2, 1, 3)
-    )
+    return tensor.reshape(
+        [tensor.shape[0] // num_heads, num_heads, tensor.shape[1], tensor.shape[2]]
+    ).permute((0, 2, 1, 3))
 
 
 def check_lastdim_alignment_stride1(

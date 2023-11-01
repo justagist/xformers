@@ -7,14 +7,16 @@ import argparse
 import contextlib
 import copy
 import csv
+import functools
 import glob
+import itertools
 import logging
 import math
 import os
 import tempfile
 from collections import defaultdict, namedtuple
 from dataclasses import replace
-from typing import Any, Dict, Generator, List, Set, Tuple
+from typing import Any, Dict, Generator, Iterator, List, Set, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -38,7 +40,13 @@ if _triton_is_available:
         _triton_is_available = False
 
 
-def pretty_print(results, title, units):
+def get_func_name(fn):
+    if isinstance(fn, functools.partial):
+        return fn.func.__name__
+    return fn.__name__
+
+
+def pretty_print(results, title, units) -> None:
     """Printout the contents of a dict as a human-readable and Markdown compatible array"""
     print(title)
     header = " Units: {:<45}".format(units)
@@ -422,8 +430,8 @@ def benchmark_main_helper(benchmark_fn, cases: List[Dict[str, Any]], **kwargs) -
     )
     args = parser.parse_args()
 
-    if args.fn is not None and args.fn != benchmark_fn.__name__:
-        print(f'Skipping benchmark "{benchmark_fn.__name__}"')
+    if args.fn is not None and args.fn != get_func_name(benchmark_fn):
+        print(f'Skipping benchmark "{get_func_name(benchmark_fn)}"')
         return
     benchmark_run_and_compare(
         benchmark_fn=benchmark_fn,
@@ -446,7 +454,7 @@ def benchmark_run_and_compare(
     quiet: bool = False,
     optimized_label: str = "optimized",
     *,
-    min_run_time: int = 2,
+    min_run_time: float = 2.0,
     atol_s: float = 30e-6,
     rtol: float = 0.05,
 ) -> None:
@@ -460,7 +468,7 @@ def benchmark_run_and_compare(
                 "XFORMERS_BENCHMARKS_CACHE",
                 os.path.join("~", ".cache", "xformers", "benchmarks"),
             ),
-            benchmark_fn.__name__,
+            get_func_name(benchmark_fn),
         )
     )
 
@@ -489,6 +497,10 @@ def benchmark_run_and_compare(
         ):
             loaded = _benchmark_results_from_csv(filename)
             for m, r in loaded:
+                if m.get(META_ALGORITHM) is not None:
+                    suffix_pos = m[META_ALGORITHM].find("@")
+                    if suffix_pos > 0:
+                        m[META_ALGORITHM] = m[META_ALGORITHM][:suffix_pos]
                 if r.task_spec.env == env and SKIP_VANILLA_TASKS_IF_ALREADY_DONE:
                     skip_vanilla_tasks.add(
                         (r.task_spec.sub_label, r.task_spec.num_threads)
@@ -654,7 +666,71 @@ def _fail_if_regressions(
     print(f"  Worse    : {num_worse}")
     if num_unk > 0:
         print(f"  (no ref) : {num_unk}")
+    benchmarks_run = num_better + num_nochange + num_worse
     if num_worse > 1:
         raise RuntimeError("At least one benchmark regressed!")
-    if num_nochange == 0:
+    elif num_unk == benchmarks_run:
         raise RuntimeError("No reference found")
+    elif benchmarks_run == 0:
+        raise RuntimeError("No benchmark was run")
+
+
+def benchmark_main_helper2(
+    name: str,
+    functions,
+    fw: bool = False,
+    bw: bool = False,
+    cuda_graph: bool = True,
+    **kwargs,
+) -> None:
+    assert fw or bw
+
+    def handle_case(**case) -> Iterator[benchmark.Timer]:
+        for k, benchmark_cls in functions.items():
+            benchmark_object = benchmark_cls(**case, bw=bw)
+            label = benchmark_object.label
+            label += "fw" if fw else ""
+            label += "bw" if bw else ""
+
+            def run_one():
+                if fw:
+                    benchmark_object.fw()
+                if bw:
+                    benchmark_object.bw()
+
+            if cuda_graph:
+                run_one()
+                benchmark_object = benchmark_cls(**case, bw=bw)
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    run_one()
+
+                def run_one():
+                    g.replay()
+
+            yield benchmark.Timer(
+                stmt="fn()",
+                globals={
+                    "fn": run_one,
+                },
+                label=label,
+                description=k,
+                sub_label=benchmark_object.sub_label,
+            )
+
+    handle_case.__name__ = name
+    benchmark_main_helper(handle_case, **kwargs)
+
+
+def product_dict(**kwargs):
+    keys = kwargs.keys()
+    vals = kwargs.values()
+    for instance in itertools.product(*vals):
+        yield dict(zip(keys, instance))
+
+
+DTYPE2STR = {
+    torch.bfloat16: "b16",
+    torch.half: "f16",
+    torch.float32: "f32",
+}

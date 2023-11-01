@@ -118,9 +118,9 @@ def get_cuda_version(cuda_dir) -> int:
 
 
 def get_flash_attention_extensions(cuda_version: int, extra_compile_args):
-    # XXX: Not supported on windows yet
+    # XXX: Not supported on windows for cuda<12
     # https://github.com/Dao-AILab/flash-attention/issues/345
-    if platform.system() != "Linux":
+    if platform.system() != "Linux" and cuda_version < 1200:
         return []
     # Figure out default archs to target
     DEFAULT_ARCHS_LIST = ""
@@ -225,7 +225,7 @@ def get_extensions():
 
     define_macros = []
 
-    extra_compile_args = {"cxx": ["-O3"]}
+    extra_compile_args = {"cxx": ["-O3", "-std=c++17"]}
     if sys.platform == "win32":
         define_macros += [("xformers_EXPORTS", None)]
         extra_compile_args["cxx"].extend(["/MP", "/Zc:lambda", "/Zc:preprocessor"])
@@ -252,6 +252,7 @@ def get_extensions():
             "-U__CUDA_NO_HALF_CONVERSIONS__",
             "--extended-lambda",
             "-D_ENABLE_EXTENDED_ALIGNED_STORAGE",
+            "-std=c++17",
         ] + get_extra_nvcc_flags_for_build_type()
         if os.getenv("XFORMERS_ENABLE_DEBUG_ASSERTIONS", "0") != "1":
             nvcc_flags.append("-DNDEBUG")
@@ -265,7 +266,6 @@ def get_extensions():
             ]
         if sys.platform == "win32":
             nvcc_flags += [
-                "-std=c++17",
                 "-Xcompiler",
                 "/Zc:lambda",
                 "-Xcompiler",
